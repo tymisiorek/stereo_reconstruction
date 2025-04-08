@@ -75,22 +75,27 @@ def match_features(sift_results, ratio_threshold=0.8):
         
     return matches_dict
 
-def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
+def apply_ransac(matches_dict, sift_results, ransac_thresh=1.0):
+    """
+    Filter the good matches using the fundamental matrix with RANSAC.
+    For nonplanar scenes, the fundamental matrix provides a more appropriate model than a homography.
+    """
     refined_matches_dict = {}
     
     for (imgA, imgB), good_matches in matches_dict.items():
         kpsA, _ = sift_results[imgA]
         kpsB, _ = sift_results[imgB]
         
-        # Ensure there are enough matches to compute a homography.
-        if len(good_matches) < 4:
+        # Require a minimum number of matches for a valid fundamental matrix estimate.
+        if len(good_matches) < 8:
             refined_matches_dict[(imgA, imgB)] = []
             continue
         
-        ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 2)
+        ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 2)
         
-        H, mask = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, ransac_thresh)
+        # Use the fundamental matrix with RANSAC.
+        F, mask = cv2.findFundamentalMat(ptsA, ptsB, cv2.FM_RANSAC, ransac_thresh, 0.99)
         if mask is None:
             refined_matches_dict[(imgA, imgB)] = []
             continue
@@ -102,7 +107,6 @@ def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
     return refined_matches_dict
 
 # --- Helper functions to serialize keypoints and matches ---
-
 def serialize_keypoints(keypoints):
     serialized = []
     for kp in keypoints:
@@ -174,8 +178,8 @@ if __name__ == "__main__":
     # 2. Match features between consecutive images
     matches_dict = match_features(sift_results, ratio_threshold=0.8)
 
-    # 3. Apply RANSAC to filter outliers
-    refined_matches_dict = apply_ransac(matches_dict, sift_results, ransac_thresh=5.0)
+    # 3. Apply RANSAC using the fundamental matrix to filter out outliers
+    refined_matches_dict = apply_ransac(matches_dict, sift_results, ransac_thresh=1.0)
     
     # 4. Save the feature data to a JSON file in the same folder structure.
     save_feature_data(sift_results, refined_matches_dict, folder_path, sequence_id)
