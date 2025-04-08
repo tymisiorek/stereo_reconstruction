@@ -1,7 +1,8 @@
 import os
 import cv2
 import numpy as np
-
+import json
+import io
 
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -9,11 +10,9 @@ import matplotlib.pyplot as plt
 from rembg import remove
 from rembg.session_factory import new_session
 
-import io
-
 from util import get_images_for_sequence
 
-#lightweight model of u2net (will install on first run, then subsequently run from cache)
+# Lightweight model of u2net (will install on first run, then subsequently run from cache)
 u2net_lite_session = new_session('u2net_lite')
 
 def remove_background_rembg(image):
@@ -22,7 +21,6 @@ def remove_background_rembg(image):
         return image
     
     pil_image = Image.open(io.BytesIO(buffer))
-
     pil_no_bg = remove(pil_image, session=u2net_lite_session)
     np_no_bg = np.array(pil_no_bg)
     if np_no_bg.shape[-1] == 4:
@@ -32,7 +30,6 @@ def remove_background_rembg(image):
 
     no_bg_bgr = cv2.cvtColor(np_no_bg, cv2.COLOR_RGB2BGR)
     return no_bg_bgr
-
 
 def sift_keypoint_detection(image_paths):
     sift = cv2.SIFT_create()
@@ -44,14 +41,12 @@ def sift_keypoint_detection(image_paths):
             continue
         
         image_no_bg = remove_background_rembg(image)
-        
         # Convert background-removed image to grayscale for SIFT
         gray = cv2.cvtColor(image_no_bg, cv2.COLOR_BGR2GRAY)
         
         keypoints, descriptors = sift.detectAndCompute(gray, None)
         results[img_path] = (keypoints, descriptors)
     return results
-
 
 def match_features(sift_results, ratio_threshold=0.8):
     bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
@@ -80,7 +75,6 @@ def match_features(sift_results, ratio_threshold=0.8):
         
     return matches_dict
 
-
 def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
     refined_matches_dict = {}
     
@@ -107,6 +101,67 @@ def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
         
     return refined_matches_dict
 
+# --- Helper functions to serialize keypoints and matches ---
+
+def serialize_keypoints(keypoints):
+    serialized = []
+    for kp in keypoints:
+        kp_dict = {
+            'pt': kp.pt,          # (x, y)
+            'size': kp.size,
+            'angle': kp.angle,
+            'response': kp.response,
+            'octave': kp.octave,
+            'class_id': kp.class_id
+        }
+        serialized.append(kp_dict)
+    return serialized
+
+def serialize_matches(matches):
+    serialized = []
+    for m in matches:
+        m_dict = {
+            'queryIdx': m.queryIdx,
+            'trainIdx': m.trainIdx,
+            'imgIdx': m.imgIdx,
+            'distance': m.distance
+        }
+        serialized.append(m_dict)
+    return serialized
+
+def save_feature_data(sift_results, refined_matches_dict, folder_path, sequence_id):
+    output_dir = os.path.join(folder_path, sequence_id)
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, "feature_data.json")
+    
+    data = {}
+    # Serialize sift_results for each image.
+    sift_data = {}
+    for img_path, (keypoints, descriptors) in sift_results.items():
+        sift_data[img_path] = {
+            'keypoints': serialize_keypoints(keypoints),
+            'descriptors': descriptors.tolist() if descriptors is not None else None
+        }
+    data['sift_results'] = sift_data
+
+    # Serialize refined_matches_dict. Convert the tuple key (imgA, imgB) to a string "imgA::imgB".
+    matches_data = {}
+    for (imgA, imgB), matches in refined_matches_dict.items():
+        key = f"{imgA}::{imgB}"
+        matches_data[key] = serialize_matches(matches)
+    data['refined_matches_dict'] = matches_data
+
+    with open(output_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Feature data saved to {output_file}")
+
+def load_feature_data(feature_file):
+    """
+    Load feature data from a JSON file.
+    """
+    with open(feature_file, 'r') as f:
+        data = json.load(f)
+    return data
 
 if __name__ == "__main__":
     folder_path = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\tripod-seq'
@@ -122,7 +177,10 @@ if __name__ == "__main__":
     # 3. Apply RANSAC to filter outliers
     refined_matches_dict = apply_ransac(matches_dict, sift_results, ransac_thresh=5.0)
     
-    # 4. Display the inlier matches for each image pair
+    # 4. Save the feature data to a JSON file in the same folder structure.
+    save_feature_data(sift_results, refined_matches_dict, folder_path, sequence_id)
+    
+    # 5. (Optional) Display the inlier matches for each image pair.
     for (imgA, imgB), inlier_matches in refined_matches_dict.items():
         imageA = cv2.imread(imgA, cv2.IMREAD_COLOR)
         imageB = cv2.imread(imgB, cv2.IMREAD_COLOR)
