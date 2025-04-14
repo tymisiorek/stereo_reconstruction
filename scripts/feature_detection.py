@@ -64,7 +64,8 @@ def sift_keypoint_detection(image_paths):
     Runs SIFT on each image (after removing its background) and returns
     a dictionary mapping image_path -> (keypoints, descriptors).
     """
-    sift = cv2.SIFT_create()
+    # sift = cv2.SIFT_create()
+    sift = cv2.SIFT_create(nfeatures=0, contrastThreshold=0.013, edgeThreshold=10, sigma=1.6)
     results = {}
     for img_path in image_paths:
         image = cv2.imread(img_path, cv2.IMREAD_COLOR)
@@ -253,12 +254,13 @@ def main():
             flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
         )
         
-        window_name = f"RANSAC Matches: {os.path.basename(imgA)} - {os.path.basename(imgB)}"
+        window_name = "My Window"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 600, 400)
+        cv2.moveWindow(window_name, 100, 100)
+        cv2.waitKey(1000)
         cv2.imshow(window_name, match_img)
-        cv2.waitKey(500)  # Display for half a second
-        cv2.destroyWindow(window_name)
+
     
     cv2.destroyAllWindows()
 
