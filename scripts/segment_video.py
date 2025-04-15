@@ -82,7 +82,7 @@ def main():
 
     print(f"Selected video: {selected_video}")
     
-    images = extract_frames(selected_video, 15)
+    images = extract_frames(selected_video, 10)
     
     # Save the frames into the 'data/images/<video_name>' directory
     output_base = os.path.join(data_path, 'images')

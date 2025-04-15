@@ -258,8 +258,8 @@ def main():
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 600, 400)
         cv2.moveWindow(window_name, 100, 100)
-        cv2.waitKey(1000)
         cv2.imshow(window_name, match_img)
+        cv2.waitKey(0)
 
     
     cv2.destroyAllWindows()
