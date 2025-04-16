@@ -31,9 +31,9 @@ def draw_inlier_keypoints(img_path, keypoints, inlier_mask, window_name="Inliers
             x, y = int(pt[0] * 0.2), int(pt[1] * 0.2)
             cv2.circle(img_resized, (x, y), 4, (0, 255, 0), -1)
 
-    cv2.imshow(window_name, img_resized)
-    cv2.waitKey(0)
-    cv2.destroyWindow(window_name)
+    # cv2.imshow(window_name, img_resized)
+    # cv2.waitKey(0)
+    # cv2.destroyWindow(window_name)
 
 def recover_pose_and_resolve_scale(tri_data, known_baseline=None):
     """

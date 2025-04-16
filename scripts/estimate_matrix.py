@@ -20,10 +20,10 @@ def extract_matched_points(sift_results, refined_matches_dict, pair_key):
             float(kp_dict["pt"][0]),
             float(kp_dict["pt"][1]),
             float(kp_dict["size"]),
-            float(kp_dict["angle"]),
-            float(kp_dict["response"]),
-            int(kp_dict["octave"]),
-            int(kp_dict["class_id"])
+            # float(kp_dict["angle"]),
+            # float(kp_dict["response"]),
+            # int(kp_dict["octave"]),
+            # int(kp_dict["class_id"])
         ) for kp_dict in imgA_data["keypoints"]
     ]
     keypointsB = [
@@ -31,10 +31,10 @@ def extract_matched_points(sift_results, refined_matches_dict, pair_key):
             float(kp_dict["pt"][0]),
             float(kp_dict["pt"][1]),
             float(kp_dict["size"]),
-            float(kp_dict["angle"]),
-            float(kp_dict["response"]),
-            int(kp_dict["octave"]),
-            int(kp_dict["class_id"])
+            # float(kp_dict["angle"]),
+            # float(kp_dict["response"]),
+            # int(kp_dict["octave"]),
+            # int(kp_dict["class_id"])
         ) for kp_dict in imgB_data["keypoints"]
     ]
 
@@ -139,11 +139,18 @@ def process_image_pairs(sift_results, refined_matches, K):
             linesA = linesA.reshape(-1, 3)
             imgA_with_lines = draw_epilines(imgA, linesA, pointsA)
 
+            # cv2.namedWindow("Image A with Epipolar Lines", cv2.WINDOW_NORMAL)
+            # cv2.resizeWindow("Image A with Epipolar Lines", 960, 540)  # or whatever size fits your screen
             # cv2.imshow("Image A with Epipolar Lines", imgA_with_lines)
+
+            # cv2.namedWindow("Image B with Epipolar Lines", cv2.WINDOW_NORMAL)
+            # cv2.resizeWindow("Image B with Epipolar Lines", 960, 540)
             # cv2.imshow("Image B with Epipolar Lines", imgB_with_lines)
+
             # print("  Press any key in the image window to continue...")
             # cv2.waitKey(0)
             # cv2.destroyAllWindows()
+
 
         pair_data = {
             "imgA": imgA_path,

@@ -2,36 +2,33 @@ import os
 import cv2
 import numpy as np
 import json
-import io
 import util
-from PIL import Image
 
-
-def sift_keypoint_detection(image_paths):
+def compute_sift_features(image_paths):
     """
-    Runs SIFT on each image (grayscale) and returns
-    a dictionary mapping image_path -> keypoints.
+    Runs SIFT on each image (grayscale) and returns a dictionary mapping image_path -> (keypoints, descriptors).
     Also prints out the number of features detected per image.
     """
     cv2.setUseOptimized(True)
     sift = cv2.SIFT_create(nfeatures=0, contrastThreshold=0.013, edgeThreshold=10, sigma=1.6)
     
-    results = {}
+    features = {}
+    gray_cache = {}
     for img_path in image_paths:
         gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if gray is None:
             print(f"Warning: Could not read {img_path}. Skipping.")
             continue
-        
-        keypoints, _ = sift.detectAndCompute(gray, None)
-        results[img_path] = keypoints
+        gray_cache[img_path] = gray  # cache grayscale image
+        keypoints, descriptors = sift.detectAndCompute(gray, None)
+        features[img_path] = (keypoints, descriptors)
         print(f"{img_path}: {len(keypoints)} features detected.")
-    return results
+    return features, gray_cache
 
-def match_features(sift_results, ratio_threshold=0.8):
+def match_features(features, ratio_threshold=0.8):
     """
-    Performs feature matching between consecutive images using a FLANN-based matcher
-    and Lowe's ratio test. Returns a dict: (imgA, imgB) -> list of 'good' matches.
+    Performs feature matching between consecutive images using a FLANN-based matcher and Lowe's ratio test.
+    Returns a dict: (imgA, imgB) -> list of 'good' matches.
     Also prints out the number of good matches found between each pair.
     """
     # FLANN parameters for SIFT descriptors
@@ -39,24 +36,15 @@ def match_features(sift_results, ratio_threshold=0.8):
     search_params = dict(checks=50)
     flann = cv2.FlannBasedMatcher(index_params, search_params)
     
-    image_paths = sorted(sift_results.keys())
+    image_paths = sorted(features.keys())
     matches_dict = {}
     
     for i in range(len(image_paths) - 1):
         imgA = image_paths[i]
         imgB = image_paths[i + 1]
         
-        # Here we need to compute descriptors for matching. We'll recompute them on the fly.
-        imageA = cv2.imread(imgA, cv2.IMREAD_GRAYSCALE)
-        imageB = cv2.imread(imgB, cv2.IMREAD_GRAYSCALE)
-        if imageA is None or imageB is None:
-            matches_dict[(imgA, imgB)] = []
-            print(f"Matching {imgA} and {imgB}: 0 good matches (could not read images).")
-            continue
-        
-        sift = cv2.SIFT_create(nfeatures=0, contrastThreshold=0.013, edgeThreshold=10, sigma=1.6)
-        _, descsA = sift.detectAndCompute(imageA, None)
-        _, descsB = sift.detectAndCompute(imageB, None)
+        kpsA, descsA = features[imgA]
+        kpsB, descsB = features[imgB]
         
         if descsA is None or descsB is None:
             matches_dict[(imgA, imgB)] = []
@@ -64,16 +52,13 @@ def match_features(sift_results, ratio_threshold=0.8):
             continue
         
         knn_matches = flann.knnMatch(descsA, descsB, k=2)
-        good_matches = [
-            m for m, n in knn_matches 
-            if m.distance < ratio_threshold * n.distance
-        ]
+        good_matches = [m for m, n in knn_matches if m.distance < ratio_threshold * n.distance]
         matches_dict[(imgA, imgB)] = good_matches
         print(f"Matching {imgA} and {imgB}: {len(good_matches)} good matches found.")
         
     return matches_dict
 
-def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
+def apply_ransac(matches_dict, features, ransac_thresh=5.0):
     """
     For each consecutive pair, fit a homography using RANSAC and return only inlier matches.
     Also prints out the number of inlier matches after RANSAC.
@@ -81,16 +66,16 @@ def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
     refined_matches_dict = {}
     
     for (imgA, imgB), good_matches in matches_dict.items():
-        keypointsA = sift_results[imgA]
-        keypointsB = sift_results[imgB]
+        kpsA, _ = features[imgA]
+        kpsB, _ = features[imgB]
         
         if len(good_matches) < 4:
             refined_matches_dict[(imgA, imgB)] = []
             print(f"RANSAC {imgA} and {imgB}: insufficient matches for homography.")
             continue
         
-        ptsA = np.float32([keypointsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        ptsB = np.float32([keypointsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         
         H, mask = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, ransac_thresh)
         if mask is None:
@@ -107,17 +92,13 @@ def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
 
 def serialize_keypoints(keypoints):
     """
-    Serialize keypoints by storing only the fields used in further processing.
+    Serialize keypoints by storing only the 'pt' and 'size' fields.
     """
     serialized = []
     for kp in keypoints:
         kp_dict = {
             'pt': kp.pt,
-            'size': kp.size,
-            'angle': kp.angle,
-            'response': kp.response,
-            'octave': kp.octave,
-            'class_id': kp.class_id
+            'size': kp.size
         }
         serialized.append(kp_dict)
     return serialized
@@ -135,19 +116,18 @@ def serialize_matches(matches):
         serialized.append(m_dict)
     return serialized
 
-def save_feature_data(sift_results, refined_matches_dict, output_folder):
+def save_feature_data(features, refined_matches_dict, output_folder):
     """
-    Saves SIFT keypoints and inlier matches to 'feature_data.json'
+    Saves SIFT keypoints (only pt and size) and inlier matches to 'feature_data.json'
     inside the chosen image folder.
     """
     output_file = os.path.join(output_folder, "feature_data.json")
     
     data = {}
     sift_data = {}
-    for img_path, keypoints in sift_results.items():
+    for img_path, (keypoints, _) in features.items():
         sift_data[img_path] = {
             'keypoints': serialize_keypoints(keypoints)
-            # Descriptors are omitted to reduce file size.
         }
     data['sift_results'] = sift_data
 
@@ -184,11 +164,12 @@ def main():
     
     print(f"Processing {len(image_paths)} images in {chosen_folder}...")
     
-    sift_results = sift_keypoint_detection(image_paths)
-    matches_dict = match_features(sift_results, ratio_threshold=0.8)
-    refined_matches_dict = apply_ransac(matches_dict, sift_results, ransac_thresh=5.0)
+    # Compute features (keypoints and descriptors) and cache grayscale images
+    features, _ = compute_sift_features(image_paths)
+    matches_dict = match_features(features, ratio_threshold=0.8)
+    refined_matches_dict = apply_ransac(matches_dict, features, ransac_thresh=5.0)
     
-    save_feature_data(sift_results, refined_matches_dict, chosen_folder)
+    save_feature_data(features, refined_matches_dict, chosen_folder)
     
     # (Optional) Visualization of matches
     for (imgA, imgB), inlier_matches in refined_matches_dict.items():
@@ -200,27 +181,26 @@ def main():
         if imageA is None or imageB is None:
             continue
         
-        keypointsA = sift_results[imgA]
-        keypointsB = sift_results[imgB]
+        kpsA, _ = features[imgA]
+        kpsB, _ = features[imgB]
         
         match_img = cv2.drawMatches(
             imageA,
-            keypointsA,
+            kpsA,
             imageB,
-            keypointsB,
+            kpsB,
             inlier_matches,
             None,
             flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
         )
         
-        window_name = "My Window"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 600, 400)
-        cv2.moveWindow(window_name, 100, 100)
-        cv2.imshow(window_name, match_img)
-        cv2.waitKey(0)
+    #     window_name = "Matches"
+    #     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    #     cv2.resizeWindow(window_name, 600, 400)
+    #     cv2.imshow(window_name, match_img)
+    #     cv2.waitKey(0)
     
-    cv2.destroyAllWindows()
+    # cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

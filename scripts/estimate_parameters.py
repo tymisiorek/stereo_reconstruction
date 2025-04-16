@@ -5,7 +5,7 @@ import os
 
 # Define chessboard size (number of inner corners per row and column)
 chessboard_size = (8, 5)  # Change to match your printed pattern (e.g., 9x6)
-square_size = 0.029  # Size of a square in meters (or any consistent unit)
+square_size = 0.028  # Size of a square in meters (or any consistent unit)
 
 # Prepare object points (3D points in the world)
 objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)

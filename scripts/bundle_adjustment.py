@@ -6,6 +6,7 @@ from scipy.optimize import least_squares
 import util
 
 ZERO_VEC3 = np.zeros(3, dtype=np.float64)
+SUBSET_SIZE = 2000  # maximum number of points to use in bundle adjustment
 
 def rodrigues_to_mat(rvec):
     """Converts a Rodrigues rotation vector to a 3x3 rotation matrix."""
@@ -25,25 +26,12 @@ def project_points_no_dist(pts_3d, K, R, t):
       K:      (3, 3) camera intrinsics.
       R:      (3, 3) rotation matrix.
       t:      (3,)   translation vector.
-
     Returns:
       proj_2d: (N, 2) array of projected 2D points.
     """
-    # 1) Rotate + translate: X_cam = R * X + t
-    #    Here we do it in a vectorized way:
-    #    R @ pts_3d^T => shape (3, N)
-    #    then add t.reshape(3,1)
     X_cam = R @ pts_3d.T + t.reshape(3, 1)   # shape => (3, N)
-
-    # 2) Apply camera intrinsics: X_img = K * X_cam
     X_img = K @ X_cam  # shape => (3, N)
-
-    # 3) Perspective divide
-    #    x' = X_img[0]/X_img[2], y' = X_img[1]/X_img[2]
-    #    We'll stack them to get shape (N, 2)
     uv = X_img[:2] / X_img[2]  # shape => (2, N)
-
-    # Transpose to (N,2)
     return uv.T
 
 def bundle_adjustment_residual(params, n_points, K, pts2d_cam1, pts2d_cam2):
@@ -52,35 +40,22 @@ def bundle_adjustment_residual(params, n_points, K, pts2d_cam1, pts2d_cam2):
       - Camera1 (fixed: R=I, t=0)
       - Camera2 (refined using Rodrigues + translation)
       - 3D points (refined)
-
     Parameter vector layout:
       [rvec_cam2 (3), tvec_cam2 (3), X1 (3), X2 (3), ..., Xn (3)]
     """
-    # Extract camera2 parameters
     rvec2 = params[:3]
     tvec2 = params[3:6]
-    # Extract 3D points
     pts_3d = params[6:].reshape(n_points, 3)
 
-    # --- Camera1: identity pose ---
-    # R=I, t=0
     R1 = np.eye(3, dtype=np.float64)
     t1 = ZERO_VEC3
-
-    # --- Camera2: from rvec2, tvec2 ---
     R2 = rodrigues_to_mat(rvec2)
 
-    # Project points in a vectorized way
     proj_cam1 = project_points_no_dist(pts_3d, K, R1, t1)
     proj_cam2 = project_points_no_dist(pts_3d, K, R2, tvec2)
 
-    # Allocate one residual array
-    # Each camera has n_points * 2  => total 2 * n_points * 2
     residuals = np.empty(2 * n_points * 2, dtype=np.float64)
-
-    # Fill camera1 residual
     residuals[: n_points * 2] = (proj_cam1 - pts2d_cam1).ravel()
-    # Fill camera2 residual
     residuals[n_points * 2:] = (proj_cam2 - pts2d_cam2).ravel()
 
     return residuals
@@ -89,6 +64,7 @@ def refine_pose_and_points_pair(pair_info):
     """
     Refines the second camera’s pose and the 3D points for a pair using two-view bundle adjustment.
     Computes RMS reprojection error before and after refinement.
+    Optionally uses a random subset of the inlier points if there are too many.
     """
     # --- Gather Data ---
     K = np.array(pair_info["camera_intrinsics"], dtype=np.float64)
@@ -115,12 +91,8 @@ def refine_pose_and_points_pair(pair_info):
         rvec2_init = mat_to_rodrigues(R2_init).flatten()
         if len(points_3d) == 0:
             return R2_init, t2_init, points_3d, 0.0, 0.0
-        
-        # Evaluate reprojection error with whatever we have
-        # We'll do a quick vectorized projection or fall back to projectPoints
-        # (Just to show you could do the same approach.)
+
         R2_eval = rodrigues_to_mat(rvec2_init)
-        # clamp to the min of 2D or 3D points
         n_eval = min(len(ptsA_inliers), len(points_3d))
         if n_eval == 0:
             return R2_init, t2_init, points_3d, 0.0, 0.0
@@ -143,6 +115,14 @@ def refine_pose_and_points_pair(pair_info):
     ptsA_inliers = ptsA_inliers[:n]
     ptsB_inliers = ptsB_inliers[:n]
     points_3d = points_3d[:n]
+
+    # Optionally select a random subset if too many points are available
+    if n > SUBSET_SIZE:
+        indices = np.random.choice(n, SUBSET_SIZE, replace=False)
+        ptsA_inliers = ptsA_inliers[indices]
+        ptsB_inliers = ptsB_inliers[indices]
+        points_3d = points_3d[indices]
+        n = SUBSET_SIZE
 
     # --- Compute Reprojection Error Before Optimization ---
     rvec2_init = mat_to_rodrigues(R2_init).flatten()
