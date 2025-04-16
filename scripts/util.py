@@ -10,12 +10,11 @@ def get_images_for_sequence(folder, sequence):
     return file_list
 
 
-def choose_image_set():
+def choose_image_set(parent_dir):
     """
     List all subdirectories under 'parent_dir' and prompt the user to pick one.
     Returns the subdirectory name chosen by the user (full path), or None if none found.
     """
-    parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
     subdirs = [
         d for d in os.listdir(parent_dir)
         if os.path.isdir(os.path.join(parent_dir, d))

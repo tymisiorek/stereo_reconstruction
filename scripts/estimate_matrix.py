@@ -139,11 +139,11 @@ def process_image_pairs(sift_results, refined_matches, K):
             linesA = linesA.reshape(-1, 3)
             imgA_with_lines = draw_epilines(imgA, linesA, pointsA)
 
-            cv2.imshow("Image A with Epipolar Lines", imgA_with_lines)
-            cv2.imshow("Image B with Epipolar Lines", imgB_with_lines)
-            print("  Press any key in the image window to continue...")
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+            # cv2.imshow("Image A with Epipolar Lines", imgA_with_lines)
+            # cv2.imshow("Image B with Epipolar Lines", imgB_with_lines)
+            # print("  Press any key in the image window to continue...")
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
 
         pair_data = {
             "imgA": imgA_path,

@@ -6,6 +6,7 @@ import io
 import util
 from PIL import Image
 
+
 def sift_keypoint_detection(image_paths):
     """
     Runs SIFT on each image (grayscale) and returns
@@ -17,7 +18,11 @@ def sift_keypoint_detection(image_paths):
     
     results = {}
     for img_path in image_paths:
-        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)        
+        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            print(f"Warning: Could not read {img_path}. Skipping.")
+            continue
+        
         keypoints, _ = sift.detectAndCompute(gray, None)
         results[img_path] = keypoints
         print(f"{img_path}: {len(keypoints)} features detected.")
@@ -70,7 +75,7 @@ def match_features(sift_results, ratio_threshold=0.8):
 
 def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
     """
-    For each consecutive pair, fit a fundamental matrix using RANSAC and return only inlier matches.
+    For each consecutive pair, fit a homography using RANSAC and return only inlier matches.
     Also prints out the number of inlier matches after RANSAC.
     """
     refined_matches_dict = {}
@@ -79,18 +84,18 @@ def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
         keypointsA = sift_results[imgA]
         keypointsB = sift_results[imgB]
         
-        if len(good_matches) < 8:
+        if len(good_matches) < 4:
             refined_matches_dict[(imgA, imgB)] = []
-            print(f"RANSAC {imgA} and {imgB}: insufficient matches for fundamental matrix estimation.")
+            print(f"RANSAC {imgA} and {imgB}: insufficient matches for homography.")
             continue
         
         ptsA = np.float32([keypointsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         ptsB = np.float32([keypointsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         
-        F, mask = cv2.findFundamentalMat(ptsA, ptsB, cv2.FM_RANSAC, ransac_thresh, 0.99)
+        H, mask = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, ransac_thresh)
         if mask is None:
             refined_matches_dict[(imgA, imgB)] = []
-            print(f"RANSAC {imgA} and {imgB}: fundamental matrix could not be computed.")
+            print(f"RANSAC {imgA} and {imgB}: homography could not be computed.")
             continue
         
         mask = mask.ravel().tolist()
@@ -161,7 +166,10 @@ def main():
     parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
     
     chosen_folder = util.choose_image_set(parent_dir)
-
+    if not chosen_folder:
+        print("No valid folder was selected. Exiting.")
+        return
+    
     all_files = os.listdir(chosen_folder)
     valid_exts = ('.png', '.jpg', '.jpeg')
     image_paths = [
@@ -170,6 +178,9 @@ def main():
         if f.lower().endswith(valid_exts)
     ]
     
+    if not image_paths:
+        print(f"No image files found in {chosen_folder}. Exiting.")
+        return
     
     print(f"Processing {len(image_paths)} images in {chosen_folder}...")
     
@@ -179,7 +190,7 @@ def main():
     
     save_feature_data(sift_results, refined_matches_dict, chosen_folder)
     
-
+    # (Optional) Visualization of matches
     for (imgA, imgB), inlier_matches in refined_matches_dict.items():
         if not inlier_matches:
             continue

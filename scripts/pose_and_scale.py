@@ -20,15 +20,15 @@ def draw_inlier_keypoints(img_path, keypoints, inlier_mask, window_name="Inliers
     """
     img = cv2.imread(img_path)
 
-    #resize image to half of its original size so it fits
-    half_width = img.shape[1] // 2
-    half_height = img.shape[0] // 2
+    #resize image to fraction of its original size so it fits
+    half_width = img.shape[1] // 5
+    half_height = img.shape[0] // 5
     img_resized = cv2.resize(img, (half_width, half_height))
 
     #draw each inlier point in green, scaling the coordinates accordingly
     for pt, valid in zip(keypoints, inlier_mask):
         if valid:
-            x, y = int(pt[0] * 0.5), int(pt[1] * 0.5)
+            x, y = int(pt[0] * 0.2), int(pt[1] * 0.2)
             cv2.circle(img_resized, (x, y), 4, (0, 255, 0), -1)
 
     cv2.imshow(window_name, img_resized)
@@ -92,8 +92,8 @@ def main():
 
     tri_data = util.load_json_data(tri_path)
 
-    # If known baseline, set it here (meters)
-    known_baseline = .12 
+    # If known baseline, set it here (meters) (doesnt seem to do anyhting)
+    known_baseline = 15
     updated_data = recover_pose_and_resolve_scale(tri_data, known_baseline=known_baseline)
 
     pose_estimation_path = os.path.join(chosen_folder, "pose_estimation_data.json")
