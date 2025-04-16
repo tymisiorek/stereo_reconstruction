@@ -3,34 +3,7 @@ import json
 import numpy as np
 import cv2
 from scipy.optimize import least_squares
-
-def choose_image_set(parent_dir):
-    """
-    Let user pick a subfolder containing triangulated_data.json.
-    """
-    subdirs = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d))]
-    if not subdirs:
-        print(f"No subdirectories found in {parent_dir}.")
-        return None
-
-    print("Choose one of the following image sets:")
-    for idx, d in enumerate(subdirs, start=1):
-        print(f"{idx}. {d}")
-
-    while True:
-        try:
-            choice = int(input("Enter the number of the folder you want to use: "))
-            if 1 <= choice <= len(subdirs):
-                return os.path.join(parent_dir, subdirs[choice - 1])
-            else:
-                print(f"Invalid selection. Enter a number between 1 and {len(subdirs)}.")
-        except ValueError:
-            print("Invalid input. Please enter a valid number.")
-
-def load_pose_estimation(json_path):
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    return data
+import util
 
 def rodrigues_to_mat(rvec):
     """Converts a Rodrigues rotation vector to a 3x3 rotation matrix."""
@@ -151,7 +124,7 @@ def refine_pose_and_points_pair(pair_info):
     result = least_squares(
         fun,
         x0,
-        method='lm',       # Levenberg–Marquardt
+        method='lm',
         xtol=1e-12,
         ftol=1e-12,
         gtol=1e-12,
@@ -190,26 +163,17 @@ def write_ply(filename, points):
 
 def main():
     parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
-    chosen_folder = choose_image_set(parent_dir)
-    if not chosen_folder:
-        print("No valid folder selected. Exiting.")
-        return
-
+    chosen_folder = util.choose_image_set(parent_dir)
     pose_path = os.path.join(chosen_folder, "pose_and_triangulation_data.json")
-    if not os.path.isfile(pose_path):
-        print(f"No pose_and_triangulation_data.json found in {chosen_folder}. Run triangulation first.")
-        return
 
-    tri_data = load_pose_estimation(pose_path)
+
+    tri_data = util.load_json_data(pose_path)
     
-    # These lists will hold errors from all pairs for global statistics.
     errors_before_list = []
     errors_after_list = []
-    
-    # This list will aggregate all refined 3D points for the final point cloud.
     all_refined_points = []
     
-    # Process each pair in the dataset.
+    #process each pair in the dataset.
     for pair_key, pair_info in tri_data.items():
         print(f"Running bundle adjustment for pair: {pair_key}")
         if "triangulated_points_3d" not in pair_info or len(pair_info["triangulated_points_3d"]) < 1:
@@ -231,20 +195,17 @@ def main():
         
         print(f"Pair {pair_key}: Reprojection error before = {error_before:.4f}, after = {error_after:.4f}")
 
-    # Save the refined bundle-adjusted data.
     output_path = os.path.join(chosen_folder, "bundle_adjusted_data.json")
     with open(output_path, 'w') as f:
         json.dump(tri_data, f, indent=2)
     print(f"Bundle adjustment complete. Refined data saved to {output_path}")
     
-    # (Optional) Print global average reprojection errors.
     if errors_before_list and errors_after_list:
         global_error_before = np.mean(errors_before_list)
         global_error_after = np.mean(errors_after_list)
         print(f"Global average reprojection error before: {global_error_before:.4f}")
         print(f"Global average reprojection error after: {global_error_after:.4f}")
     
-    # Write the aggregated refined point cloud to a PLY file for MeshLab.
     if all_refined_points:
         ply_filename = os.path.join(chosen_folder, "refined_point_cloud.ply")
         write_ply(ply_filename, all_refined_points)

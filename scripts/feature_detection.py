@@ -3,61 +3,8 @@ import cv2
 import numpy as np
 import json
 import io
-
+import util
 from PIL import Image
-# from rembg import remove
-# from rembg.session_factory import new_session
-
-# Uncomment below if you actually need rembg:
-# u2net_lite_session = new_session('u2net_lite')
-
-def choose_image_set(parent_dir):
-    """
-    List all subdirectories under 'parent_dir' and prompt the user to pick one.
-    Returns the subdirectory name chosen by the user (full path), or None if none found.
-    """
-    subdirs = [
-        d for d in os.listdir(parent_dir)
-        if os.path.isdir(os.path.join(parent_dir, d))
-    ]
-    if not subdirs:
-        print(f"No subdirectories found in {parent_dir}.")
-        return None
-
-    print("Choose one of the following image sets:")
-    for idx, d in enumerate(subdirs, start=1):
-        print(f"{idx}. {d}")
-
-    while True:
-        try:
-            choice = int(input("Enter the number of the folder you want to use: "))
-            if 1 <= choice <= len(subdirs):
-                return os.path.join(parent_dir, subdirs[choice - 1])
-            else:
-                print(f"Invalid selection. Enter a number between 1 and {len(subdirs)}.")
-        except ValueError:
-            print("Invalid input. Please enter a valid number.")
-
-# Optional: If you decide to use rembg again, just uncomment and reinstate in your pipeline.
-# def remove_background_rembg(image):
-#     """
-#     Removes background using rembg, returning an image where the background is black.
-#     """
-#     is_success, buffer = cv2.imencode(".png", image)
-#     if not is_success:
-#         return image
-#     
-#     pil_image = Image.open(io.BytesIO(buffer))
-#     pil_no_bg = remove(pil_image, session=u2net_lite_session)
-#     np_no_bg = np.array(pil_no_bg)
-#     # If alpha channel exists, make background black
-#     if np_no_bg.shape[-1] == 4:
-#         alpha = np_no_bg[:, :, 3]
-#         np_no_bg = np_no_bg[:, :, :3]
-#         np_no_bg[alpha == 0] = [0, 0, 0]
-# 
-#     no_bg_bgr = cv2.cvtColor(np_no_bg, cv2.COLOR_RGB2BGR)
-#     return no_bg_bgr
 
 def sift_keypoint_detection(image_paths):
     """
@@ -70,11 +17,7 @@ def sift_keypoint_detection(image_paths):
     
     results = {}
     for img_path in image_paths:
-        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-        if gray is None:
-            print(f"Warning: Could not read {img_path}. Skipping.")
-            continue
-        
+        gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)        
         keypoints, _ = sift.detectAndCompute(gray, None)
         results[img_path] = keypoints
         print(f"{img_path}: {len(keypoints)} features detected.")
@@ -127,7 +70,7 @@ def match_features(sift_results, ratio_threshold=0.8):
 
 def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
     """
-    For each consecutive pair, fit a homography using RANSAC and return only inlier matches.
+    For each consecutive pair, fit a fundamental matrix using RANSAC and return only inlier matches.
     Also prints out the number of inlier matches after RANSAC.
     """
     refined_matches_dict = {}
@@ -136,18 +79,18 @@ def apply_ransac(matches_dict, sift_results, ransac_thresh=5.0):
         keypointsA = sift_results[imgA]
         keypointsB = sift_results[imgB]
         
-        if len(good_matches) < 4:
+        if len(good_matches) < 8:
             refined_matches_dict[(imgA, imgB)] = []
-            print(f"RANSAC {imgA} and {imgB}: insufficient matches for homography.")
+            print(f"RANSAC {imgA} and {imgB}: insufficient matches for fundamental matrix estimation.")
             continue
         
         ptsA = np.float32([keypointsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         ptsB = np.float32([keypointsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
         
-        H, mask = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, ransac_thresh)
+        F, mask = cv2.findFundamentalMat(ptsA, ptsB, cv2.FM_RANSAC, ransac_thresh, 0.99)
         if mask is None:
             refined_matches_dict[(imgA, imgB)] = []
-            print(f"RANSAC {imgA} and {imgB}: homography could not be computed.")
+            print(f"RANSAC {imgA} and {imgB}: fundamental matrix could not be computed.")
             continue
         
         mask = mask.ravel().tolist()
@@ -217,11 +160,8 @@ def main():
     cv2.setUseOptimized(True)
     parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
     
-    chosen_folder = choose_image_set(parent_dir)
-    if not chosen_folder:
-        print("No valid folder was selected. Exiting.")
-        return
-    
+    chosen_folder = util.choose_image_set(parent_dir)
+
     all_files = os.listdir(chosen_folder)
     valid_exts = ('.png', '.jpg', '.jpeg')
     image_paths = [
@@ -230,9 +170,6 @@ def main():
         if f.lower().endswith(valid_exts)
     ]
     
-    if not image_paths:
-        print(f"No image files found in {chosen_folder}. Exiting.")
-        return
     
     print(f"Processing {len(image_paths)} images in {chosen_folder}...")
     
@@ -242,7 +179,7 @@ def main():
     
     save_feature_data(sift_results, refined_matches_dict, chosen_folder)
     
-    # (Optional) Visualization of matches
+
     for (imgA, imgB), inlier_matches in refined_matches_dict.items():
         if not inlier_matches:
             continue
