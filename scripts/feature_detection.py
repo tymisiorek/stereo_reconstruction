@@ -4,203 +4,206 @@ import numpy as np
 import json
 import util
 
+
+# ────────────────────────────────────────────────────────────────────────────
+# 1.  SIFT feature extraction
+# ────────────────────────────────────────────────────────────────────────────
 def compute_sift_features(image_paths):
     """
-    Runs SIFT on each image (grayscale) and returns a dictionary mapping image_path -> (keypoints, descriptors).
-    Also prints out the number of features detected per image.
+    Detect SIFT key‑points & descriptors for each image.
+    Returns:
+        features : dict  image_path → (keypoints, descriptors)
+        gray_cache : dict image_path → grayscale image
     """
     cv2.setUseOptimized(True)
-    sift = cv2.SIFT_create(nfeatures=0, contrastThreshold=0.013, edgeThreshold=10, sigma=1.6)
-    
-    features = {}
-    gray_cache = {}
+    sift = cv2.SIFT_create(
+        nfeatures=0,           # keep all
+        contrastThreshold=0.013,
+        edgeThreshold=10,
+        sigma=1.6
+    )
+
+    features, gray_cache = {}, {}
     for img_path in image_paths:
         gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if gray is None:
-            print(f"Warning: Could not read {img_path}. Skipping.")
+            print(f"[WARN] Could not read {img_path} – skipped.")
             continue
-        gray_cache[img_path] = gray  # cache grayscale image
-        keypoints, descriptors = sift.detectAndCompute(gray, None)
-        features[img_path] = (keypoints, descriptors)
-        print(f"{img_path}: {len(keypoints)} features detected.")
+
+        gray_cache[img_path] = gray
+        kps, descs = sift.detectAndCompute(gray, None)
+        features[img_path] = (kps, descs)
+        print(f"{img_path}: {len(kps)} features.")
+
     return features, gray_cache
 
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2.  Feature matching (all image pairs)
+# ────────────────────────────────────────────────────────────────────────────
 def match_features(features, ratio_threshold=0.8):
     """
-    Performs feature matching between consecutive images using a FLANN-based matcher and Lowe's ratio test.
-    Returns a dict: (imgA, imgB) -> list of 'good' matches.
-    Also prints out the number of good matches found between each pair.
+    Match descriptors for *every* pair of images using FLANN + Lowe ratio test.
+    Returns:
+        matches_dict : {(imgA, imgB)} → list[cv2.DMatch]
     """
-    # FLANN parameters for SIFT descriptors
-    index_params = dict(algorithm=1, trees=5)  # algorithm=1 for KDTree
+    # FLANN params for SIFT (KD‑Tree)
+    index_params = dict(algorithm=1, trees=5)
     search_params = dict(checks=50)
     flann = cv2.FlannBasedMatcher(index_params, search_params)
-    
+
     image_paths = sorted(features.keys())
     matches_dict = {}
-    
+
     for i in range(len(image_paths) - 1):
-        imgA = image_paths[i]
-        imgB = image_paths[i + 1]
-        
-        kpsA, descsA = features[imgA]
-        kpsB, descsB = features[imgB]
-        
-        if descsA is None or descsB is None:
-            matches_dict[(imgA, imgB)] = []
-            print(f"Matching {imgA} and {imgB}: 0 good matches (missing descriptors).")
-            continue
-        
-        knn_matches = flann.knnMatch(descsA, descsB, k=2)
-        good_matches = [m for m, n in knn_matches if m.distance < ratio_threshold * n.distance]
-        matches_dict[(imgA, imgB)] = good_matches
-        print(f"Matching {imgA} and {imgB}: {len(good_matches)} good matches found.")
-        
+        for j in range(i + 1, len(image_paths)):
+            imgA, imgB = image_paths[i], image_paths[j]
+            kpsA, descA = features[imgA]
+            kpsB, descB = features[imgB]
+
+            if descA is None or descB is None:
+                matches_dict[(imgA, imgB)] = []
+                print(f"Match {imgA} ↔ {imgB}: 0 (missing desc).")
+                continue
+
+            knn = flann.knnMatch(descA, descB, k=2)
+            good = [m for m, n in knn if m.distance < ratio_threshold * n.distance]
+            matches_dict[(imgA, imgB)] = good
+            print(f"Match {imgA} ↔ {imgB}: {len(good)} good.")
+
     return matches_dict
 
-def apply_ransac(matches_dict, features, ransac_thresh=5.0):
+
+# ────────────────────────────────────────────────────────────────────────────
+# 3.  RANSAC with Fundamental matrix (epipolar geometry)
+# ────────────────────────────────────────────────────────────────────────────
+def apply_ransac(matches_dict, features, ransac_thresh=1.0):
     """
-    For each consecutive pair, fit a homography using RANSAC and return only inlier matches.
-    Also prints out the number of inlier matches after RANSAC.
+    Robustly estimate a Fundamental matrix for each pair, keep inlier matches.
+    Works for arbitrary 3‑D scenes (no planar assumption).
+    Returns:
+        refined_matches_dict : {(imgA, imgB)} → inlier list[cv2.DMatch]
     """
-    refined_matches_dict = {}
-    
-    for (imgA, imgB), good_matches in matches_dict.items():
+    refined = {}
+
+    for (imgA, imgB), good in matches_dict.items():
         kpsA, _ = features[imgA]
         kpsB, _ = features[imgB]
-        
-        if len(good_matches) < 4:
-            refined_matches_dict[(imgA, imgB)] = []
-            print(f"RANSAC {imgA} and {imgB}: insufficient matches for homography.")
-            continue
-        
-        ptsA = np.float32([kpsA[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        ptsB = np.float32([kpsB[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        
-        H, mask = cv2.findHomography(ptsA, ptsB, cv2.RANSAC, ransac_thresh)
-        if mask is None:
-            refined_matches_dict[(imgA, imgB)] = []
-            print(f"RANSAC {imgA} and {imgB}: homography could not be computed.")
-            continue
-        
-        mask = mask.ravel().tolist()
-        inlier_matches = [gm for gm, mk in zip(good_matches, mask) if mk == 1]
-        refined_matches_dict[(imgA, imgB)] = inlier_matches
-        print(f"RANSAC {imgA} and {imgB}: {len(inlier_matches)} inlier matches found.")
-        
-    return refined_matches_dict
 
-def serialize_keypoints(keypoints):
-    """
-    Serialize keypoints by storing only the 'pt' and 'size' fields.
-    """
-    serialized = []
-    for kp in keypoints:
-        kp_dict = {
-            'pt': kp.pt,
-            'size': kp.size
-        }
-        serialized.append(kp_dict)
-    return serialized
+        if len(good) < 8:            # 8‑point alg. minimum
+            refined[(imgA, imgB)] = []
+            print(f"RANSAC {imgA} ↔ {imgB}: <8 matches.")
+            continue
+
+        ptsA = np.float32([kpsA[m.queryIdx].pt for m in good])
+        ptsB = np.float32([kpsB[m.trainIdx].pt for m in good])
+
+        F, mask = cv2.findFundamentalMat(
+            ptsA, ptsB, cv2.FM_RANSAC, ransac_thresh, 0.99
+        )
+        if mask is None:
+            refined[(imgA, imgB)] = []
+            print(f"RANSAC {imgA} ↔ {imgB}: F‑matrix failed.")
+            continue
+
+        inliers = [gm for gm, mk in zip(good, mask.ravel()) if mk]
+        refined[(imgA, imgB)] = inliers
+        print(f"RANSAC {imgA} ↔ {imgB}: {len(inliers)} inliers.")
+
+    return refined
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4.  JSON helpers
+# ────────────────────────────────────────────────────────────────────────────
+def serialize_keypoints(kps):
+    return [{'pt': kp.pt, 'size': kp.size} for kp in kps]
+
 
 def serialize_matches(matches):
+    return [{'queryIdx': m.queryIdx, 'trainIdx': m.trainIdx} for m in matches]
+
+
+def save_feature_data(features, refined, out_folder):
     """
-    Serialize matches by storing only queryIdx and trainIdx.
+    Write SIFT key‑points (pt & size) and inlier matches to feature_data.json.
     """
-    serialized = []
-    for m in matches:
-        m_dict = {
-            'queryIdx': m.queryIdx,
-            'trainIdx': m.trainIdx
+    out_file = os.path.join(out_folder, "feature_data.json")
+    data = {
+        'sift_results': {
+            img: {'keypoints': serialize_keypoints(kps)}
+            for img, (kps, _) in features.items()
+        },
+        'refined_matches_dict': {
+            f"{imgA}::{imgB}": serialize_matches(m)
+            for (imgA, imgB), m in refined.items()
         }
-        serialized.append(m_dict)
-    return serialized
+    }
+    with open(out_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"[OK] Feature data → {out_file}")
 
-def save_feature_data(features, refined_matches_dict, output_folder):
-    """
-    Saves SIFT keypoints (only pt and size) and inlier matches to 'feature_data.json'
-    inside the chosen image folder.
-    """
-    output_file = os.path.join(output_folder, "feature_data.json")
-    
-    data = {}
-    sift_data = {}
-    for img_path, (keypoints, _) in features.items():
-        sift_data[img_path] = {
-            'keypoints': serialize_keypoints(keypoints)
-        }
-    data['sift_results'] = sift_data
 
-    matches_data = {}
-    for (imgA, imgB), matches in refined_matches_dict.items():
-        key = f"{imgA}::{imgB}"
-        matches_data[key] = serialize_matches(matches)
-    data['refined_matches_dict'] = matches_data
-
-    with open(output_file, 'w') as f:
-        json.dump(data, f)
-    print(f"Feature data saved to {output_file}")
-
+# ────────────────────────────────────────────────────────────────────────────
+# 5.  Main driver
+# ────────────────────────────────────────────────────────────────────────────
 def main():
     cv2.setUseOptimized(True)
-    parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
-    
+
+    parent_dir = r'C:\Users\Owen-McKenney\OneDrive\Desktop\CS4501 Computer Vision\stereo_reconstruction\data\images'
     chosen_folder = util.choose_image_set(parent_dir)
     if not chosen_folder:
-        print("No valid folder was selected. Exiting.")
+        print("No folder selected – exiting.")
         return
-    
-    all_files = os.listdir(chosen_folder)
+
     valid_exts = ('.png', '.jpg', '.jpeg')
-    image_paths = [
+    image_paths = sorted(
         os.path.join(chosen_folder, f)
-        for f in sorted(all_files)
+        for f in os.listdir(chosen_folder)
         if f.lower().endswith(valid_exts)
-    ]
-    
+    )
     if not image_paths:
-        print(f"No image files found in {chosen_folder}. Exiting.")
+        print("No images found – exiting.")
         return
-    
-    print(f"Processing {len(image_paths)} images in {chosen_folder}...")
-    
-    # Compute features (keypoints and descriptors) and cache grayscale images
+
+    print(f"Processing {len(image_paths)} images …")
+
+    # 1. SIFT
     features, _ = compute_sift_features(image_paths)
+
+    # 2. Matching
     matches_dict = match_features(features, ratio_threshold=0.8)
-    refined_matches_dict = apply_ransac(matches_dict, features, ransac_thresh=5.0)
-    
-    save_feature_data(features, refined_matches_dict, chosen_folder)
-    
-    # (Optional) Visualization of matches
-    for (imgA, imgB), inlier_matches in refined_matches_dict.items():
-        if not inlier_matches:
+
+    # 3. Epipolar‑RANSAC
+    refined_matches = apply_ransac(matches_dict, features, ransac_thresh=1.0)
+
+    # 4. Save
+    save_feature_data(features, refined_matches, chosen_folder)
+
+    # (Optional) visualise inliers
+    for (imgA, imgB), inliers in refined_matches.items():
+        if not inliers:
             continue
-        
-        imageA = cv2.imread(imgA, cv2.IMREAD_COLOR)
-        imageB = cv2.imread(imgB, cv2.IMREAD_COLOR)
-        if imageA is None or imageB is None:
+
+        imgA_color = cv2.imread(imgA)
+        imgB_color = cv2.imread(imgB)
+        if imgA_color is None or imgB_color is None:
             continue
-        
+
         kpsA, _ = features[imgA]
         kpsB, _ = features[imgB]
-        
-        match_img = cv2.drawMatches(
-            imageA,
-            kpsA,
-            imageB,
-            kpsB,
-            inlier_matches,
-            None,
+
+        vis = cv2.drawMatches(
+            imgA_color, kpsA,
+            imgB_color, kpsB,
+            inliers, None,
             flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
         )
-        
-    #     window_name = "Matches"
-    #     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    #     cv2.resizeWindow(window_name, 600, 400)
-    #     cv2.imshow(window_name, match_img)
-    #     cv2.waitKey(0)
-    
-    # cv2.destroyAllWindows()
+        cv2.namedWindow("Inlier matches", cv2.WINDOW_NORMAL)
+        cv2.imshow("Inlier matches", vis)
+        cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

@@ -171,7 +171,7 @@ def process_image_pairs(sift_results, refined_matches, K):
     return triangulation_data
 
 def main():
-    parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
+    parent_dir = r'C:\Users\Owen-McKenney\OneDrive\Desktop\CS4501 Computer Vision\stereo_reconstruction\data\images'
     chosen_folder = util.choose_image_set(parent_dir)
     json_path = os.path.join(chosen_folder, "feature_data.json")
 
