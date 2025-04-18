@@ -7,15 +7,15 @@ import util
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-RATIO_TEST       = 0.8      # Lowe’s ratio
-RANSAC_CONF      = 0.99
-RANSAC_REPROJ    = 3.0      # in pixels
-SAMPSON_THRESH   = 1.0      # prune large‐error inliers
-MIN_F_INLIERS    = 30
+RATIO_TEST     = .99
+RANSAC_CONF    = 0.5
+RANSAC_REPROJ  = 10.0
+SAMPSON_THRESH = 1.0
+MIN_F_INLIERS  = 10
 
-# -----------------------------------------------------------------------------
-# 1.  Detect & describe
-# -----------------------------------------------------------------------------
+# NEW FLAG: set True to bypass Sampson pruning
+SKIP_SAMPSON   = True
+
 def compute_sift_features(image_paths):
     sift = cv2.SIFT_create(contrastThreshold=0.013, edgeThreshold=10, sigma=1.6)
     features = {}
@@ -29,9 +29,6 @@ def compute_sift_features(image_paths):
         print(f"[FEAT] {os.path.basename(p)} → {len(kps)} keypoints")
     return features
 
-# -----------------------------------------------------------------------------
-# 2.  Pairwise match + ratio test
-# -----------------------------------------------------------------------------
 def match_features(features):
     index_params = dict(algorithm=1, trees=5)
     flann = cv2.FlannBasedMatcher(index_params, dict(checks=50))
@@ -39,26 +36,23 @@ def match_features(features):
     matches = {}
     for i in range(len(paths)-1):
         for j in range(i+1, len(paths)):
-            a,b = paths[i], paths[j]
+            a, b = paths[i], paths[j]
             kpsA, dA = features[a]
             kpsB, dB = features[b]
             if dA is None or dB is None:
                 matches[(a,b)] = []
                 continue
             knn = flann.knnMatch(dA, dB, k=2)
-            good = [m for m,n in knn if m.distance < RATIO_TEST*n.distance]
+            good = [m for m,n in knn if m.distance < RATIO_TEST * n.distance]
             print(f"[MATCH] {os.path.basename(a)}↔{os.path.basename(b)}: {len(good)}")
             matches[(a,b)] = good
     return matches
 
-# -----------------------------------------------------------------------------
-# 3.  Fundamental RANSAC + Sampson prune
-# -----------------------------------------------------------------------------
 def prune_matches(matches, features):
     refined = {}
     for (a,b), mlist in matches.items():
-        kpsA,_ = features[a]
-        kpsB,_ = features[b]
+        kpsA, _ = features[a]
+        kpsB, _ = features[b]
         if len(mlist) < MIN_F_INLIERS:
             print(f"[SKIP] {os.path.basename(a)}↔{os.path.basename(b)} (<{MIN_F_INLIERS} matches)")
             continue
@@ -75,41 +69,59 @@ def prune_matches(matches, features):
             print(f"[F FAIL] {os.path.basename(a)}↔{os.path.basename(b)}")
             continue
 
-        # Sampson error prune
-        idx = mask.ravel()==1
-        ptsA_h = np.hstack([ptsA[idx], np.ones((idx.sum(),1))])
-        ptsB_h = np.hstack([ptsB[idx], np.ones((idx.sum(),1))])
-        Fx1 = (F @ ptsA_h.T)
-        Ftx2= (F.T @ ptsB_h.T)
-        num = np.sum(ptsB_h*(F @ ptsA_h.T).T, axis=1)**2
-        den = Fx1[0]**2 + Fx1[1]**2 + Ftx2[0]**2 + Ftx2[1]**2 + 1e-12
-        sampson = num/den
-        keep = sampson<=SAMPSON_THRESH
+        mask = mask.ravel().astype(bool)
 
-        new_mask = np.zeros_like(mask.ravel(),dtype=bool)
-        idxs = np.flatnonzero(idx)
-        new_mask[idxs[keep]] = True
+        if SKIP_SAMPSON:
+            inliers = [m for m,k in zip(mlist, mask) if k]
+            print(f"[F INL] {os.path.basename(a)}↔{os.path.basename(b)}: {len(inliers)}/{len(mlist)} (skipped Sampson)")
+        else:
+            # Sampson error prune
+            idx = mask
+            ptsA_h = np.hstack([ptsA[idx], np.ones((idx.sum(),1))])
+            ptsB_h = np.hstack([ptsB[idx], np.ones((idx.sum(),1))])
+            Fx1   = (F @ ptsA_h.T)
+            Ftx2  = (F.T @ ptsB_h.T)
+            num   = np.sum(ptsB_h * (F @ ptsA_h.T).T, axis=1)**2
+            den   = Fx1[0]**2 + Fx1[1]**2 + Ftx2[0]**2 + Ftx2[1]**2 + 1e-12
+            sampson = num/den
+            keep    = sampson <= SAMPSON_THRESH
 
-        inliers = [m for m,k in zip(mlist,new_mask) if k]
-        print(f"[F INL] {os.path.basename(a)}↔{os.path.basename(b)}: {len(inliers)}/{len(mlist)}")
+            new_mask = np.zeros_like(mask, dtype=bool)
+            idxs = np.flatnonzero(idx)
+            new_mask[idxs[keep]] = True
+
+            inliers = [m for m,k in zip(mlist,new_mask) if k]
+            print(f"[F INL] {os.path.basename(a)}↔{os.path.basename(b)}: {len(inliers)}/{len(mlist)}")
+
+        # visualize inliers full-screen
+        imgA = cv2.imread(a)
+        imgB = cv2.imread(b)
+        vis = cv2.drawMatches(
+            imgA, kpsA, imgB, kpsB, inliers, None,
+            matchColor=(0,255,0),
+            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+        )
+        win = f"Inliers {os.path.basename(a)}↔{os.path.basename(b)}"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        cv2.imshow(win, vis)
+        cv2.waitKey(0)
+        cv2.destroyWindow(win)
+
         refined[(a,b)] = inliers
+
     return refined
 
-# -----------------------------------------------------------------------------
-# 4.  Serialize
-# -----------------------------------------------------------------------------
 def save_feature_data(features, refined, folder):
     out = {}
-    # keypoints
     out['sift_results'] = {
-        p: [{'pt':kp.pt,'size':kp.size} for kp in kps]
+        p: [{'pt': kp.pt, 'size': kp.size} for kp in kps]
         for p,(kps,_) in features.items()
     }
-    # matches
     out['refined_matches_dict'] = {}
-    for (a,b),mlist in refined.items():
-        kpsA,_ = features[a]
-        kpsB,_ = features[b]
+    for (a,b), mlist in refined.items():
+        kpsA, _ = features[a]
+        kpsB, _ = features[b]
         lst = []
         for m in mlist:
             lst.append({
@@ -125,9 +137,6 @@ def save_feature_data(features, refined, folder):
         json.dump(out,f,indent=2)
     print(f"[OK] saved → {path}")
 
-# -----------------------------------------------------------------------------
-# 5.  Main
-# -----------------------------------------------------------------------------
 def main():
     parent = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
     folder = util.choose_image_set(parent)
@@ -138,7 +147,7 @@ def main():
         for f in os.listdir(folder)
         if f.lower().endswith(('.png','.jpg','.jpeg'))
     ])
-    print(f"Found {len(imgs)} images")
+    print(f"[INFO] Found {len(imgs)} images")
 
     feats   = compute_sift_features(imgs)
     matches = match_features(feats)
