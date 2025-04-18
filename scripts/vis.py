@@ -1,131 +1,279 @@
-import os
-import json
-import numpy as np
+#!/usr/bin/env python3
+# pipeline.py
+
+import os, re, json
 import cv2
+import numpy as np
 import util
 
-def visualize_correspondences(img_path, pts2d, pts3d, R, t, K, window_name="Correspondences"):
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+RANSAC_CONF       = 0.99     # confidence for Essential‐matrix RANSAC
+RANSAC_REPROJ     = 0.005    # 0.5% of image diagonal → pixels
+MIN_INLIERS       = 30       # drop any pair with fewer pose inliers
+MIN_RATIO         = 0.20     # or with inlier ratio below this
+VERBOSE           = True     # print debug info
+
+# -----------------------------------------------------------------------------
+# HELPERS TO SORT PAIRS IN SEQUENTIAL ORDER
+# -----------------------------------------------------------------------------
+def extract_index(path):
+    """chapel_12.jpeg → 12 (for sorting)."""
+    m = re.search(r'(\d+)', os.path.basename(path))
+    return int(m.group(1)) if m else -1
+
+def sort_pairs(pair_keys):
+    """Sort 'imgA::imgB' by (index(imgA), index(imgB))."""
+    def keyfn(k):
+        a,b = k.split("::")
+        return (extract_index(a), extract_index(b))
+    return sorted(pair_keys, key=keyfn)
+
+# -----------------------------------------------------------------------------
+# STEP 1: ESTIMATE ESSENTIAL MATRIX + RELATIVE POSE
+# -----------------------------------------------------------------------------
+def estimate_relposes(folder):
+    # — load intrinsics —
+    fx, fy = 1826.35890, 1826.55090
+    cx, cy =  520.668647, 955.447831
+    K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], dtype=np.float64)
+    if VERBOSE: print(f"[1] Using intrinsics:\n{K}")
+
+    # — load SIFT results + refined matches —
+    feat_f = os.path.join(folder, "feature_data.json")
+    if not os.path.exists(feat_f):
+        raise FileNotFoundError(f"Missing {feat_f}")
+    with open(feat_f,'r') as f:
+        feat = json.load(f)
+    refined_matches = feat["refined_matches_dict"]
+
+    # — dynamic RANSAC threshold (~0.5% of diagonal) —
+    sample_img = cv2.imread(next(iter(feat["sift_results"].keys())))
+    h, w = sample_img.shape[:2]
+    pix_thresh = RANSAC_REPROJ * np.hypot(w, h)
+    if VERBOSE:
+        print(f"[1] RANSAC reproj‐threshold = {pix_thresh:.2f}px")
+
+    tri_data = {}
+    for pair_key, matches in refined_matches.items():
+        ptsA = np.asarray([m["ptA"] for m in matches], np.float64)
+        ptsB = np.asarray([m["ptB"] for m in matches], np.float64)
+        n    = ptsA.shape[0]
+        if VERBOSE:
+            print(f"\n[1] Pair {pair_key}: {n} raw matches")
+        if n < 8:
+            if VERBOSE: print("   ↳ too few matches, skipping")
+            continue
+
+        # — findEssentialMat over all matches →
+        E, maskE = cv2.findEssentialMat(
+            ptsA, ptsB, K,
+            method=cv2.FM_RANSAC,
+            prob=RANSAC_CONF,
+            threshold=pix_thresh
+        )
+        if E is None or maskE is None or maskE.shape[0] != n:
+            if VERBOSE: print("   ↳ Essential failed, skipping")
+            continue
+        maskE = maskE.ravel().astype(bool)
+        inE   = maskE.sum()
+        if VERBOSE:
+            print(f"   ↳ Essential inliers: {inE}/{n}")
+        if inE < MIN_INLIERS or (inE / n) < MIN_RATIO:
+            if VERBOSE: print("   ↳ too few essential inliers, skipping")
+            continue
+
+        # — recoverPose on only the essential inliers →
+        ptsA_e = ptsA[maskE]
+        ptsB_e = ptsB[maskE]
+        _, R_rel, t_rel, maskP = cv2.recoverPose(E, ptsA_e, ptsB_e, K)
+        maskP = maskP.ravel().astype(bool)
+        inP   = maskP.sum()
+        if VERBOSE:
+            print(f"   ↳ Pose inliers:     {inP}/{inE}")
+        if inP < MIN_INLIERS or (inP / inE) < MIN_RATIO:
+            if VERBOSE: print("   ↳ too few pose inliers, skipping")
+            continue
+
+        # — build full‐length pose‐mask over original matches →
+        full_mask = np.zeros(n, bool)
+        idxs = np.nonzero(maskE)[0]
+        full_mask[idxs[maskP]] = True
+
+        tri_data[pair_key] = {
+            "imgA":                   pair_key.split("::")[0],
+            "imgB":                   pair_key.split("::")[1],
+            "camera_intrinsics":      K.tolist(),
+            "matched_points_imgA":    ptsA.tolist(),
+            "matched_points_imgB":    ptsB.tolist(),
+            "essential_matrix":       E.tolist(),
+            "inlier_mask_essential":  maskE.astype(int).tolist(),
+            "recovered_rotation":     R_rel.tolist(),
+            "recovered_translation":  t_rel.ravel().tolist(),
+            "inlier_mask_pose":       full_mask.astype(int).tolist()
+        }
+
+    out1 = os.path.join(folder, "triangulation_data.json")
+    with open(out1, "w") as f:
+        json.dump(tri_data, f, indent=2)
+    print(f"[1] Wrote relative‐pose data → {out1}")
+    return tri_data
+
+# -----------------------------------------------------------------------------
+# STEP 2: CHAIN INTO METRIC GLOBAL FRAME
+# -----------------------------------------------------------------------------
+def chain_global_poses(tri_data):
+    keys = sort_pairs(tri_data.keys())
+
+    # start first image at identity
+    first_img = tri_data[keys[0]]["imgA"]
+    extrinsics = {
+        first_img: (
+            np.eye(3, dtype=np.float64),
+            np.zeros((3,1), dtype=np.float64)
+        )
+    }
+
+    pose_data = {}
+    for key in keys:
+        info = tri_data[key]
+        A, B = info["imgA"], info["imgB"]
+        maskP = np.asarray(info["inlier_mask_pose"], np.int32).astype(bool)
+        if maskP.sum() < MIN_INLIERS or (maskP.sum()/maskP.size) < MIN_RATIO:
+            if VERBOSE: print(f"[2] skip chain {key} ({maskP.sum()}/{maskP.size})")
+            continue
+
+        R_rel = np.asarray(info["recovered_rotation"],    np.float64)
+        t_rel = np.asarray(info["recovered_translation"], np.float64).reshape(3,1)
+
+        # forward: if we know A, build B
+        if A in extrinsics and B not in extrinsics:
+            R_A, t_A = extrinsics[A]
+            R_B = R_rel @ R_A
+            t_B = R_rel @ t_A + t_rel
+            extrinsics[B] = (R_B, t_B)
+
+        # backward: if we know B, build A
+        elif B in extrinsics and A not in extrinsics:
+            R_B, t_B = extrinsics[B]
+            R_A = R_rel.T @ R_B
+            t_A = R_rel.T @ (t_B - t_rel)
+            extrinsics[A] = (R_A, t_A)
+
+        else:
+            if VERBOSE:
+                print(f"[2] cannot chain {key} (both known or both unknown)")
+            continue
+
+        # compute camera centers C = -R^T t
+        Rg_A, tg_A = extrinsics[A]
+        Rg_B, tg_B = extrinsics[B]
+        Cg_A = (-Rg_A.T @ tg_A).ravel().tolist()
+        Cg_B = (-Rg_B.T @ tg_B).ravel().tolist()
+
+        info.update({
+            "rotation_global_A":      Rg_A.tolist(),
+            "camera_center_global_A": Cg_A,
+            "rotation_global_B":      Rg_B.tolist(),
+            "camera_center_global_B": Cg_B
+        })
+        pose_data[key] = info
+
+        if VERBOSE:
+            print(f"[2] chained {A}→{B}:  C_A={Cg_A}  C_B={Cg_B}")
+
+    out2 = os.path.join(
+        os.path.dirname(next(iter(pose_data.values()))["imgA"]),
+        "pose_estimation_data.json"
+    )
+    with open(out2, "w") as f:
+        json.dump(pose_data, f, indent=2)
+    print(f"[2] Wrote global‑pose data → {out2}")
+    return pose_data
+
+
+
+def triangulate_and_write(pose_data):
     """
-    Visualize 2D keypoints (pts2d) and the reprojected 3D points (pts3d) on the image.
-    
-    Parameters:
-      img_path: Path to the image.
-      pts2d: 2D keypoints (Nx2 array) from the image.
-      pts3d: 3D points (Nx3 array) that correspond to the 2D keypoints.
-      R: Rotation matrix (3x3) from the pose estimation.
-      t: Translation vector (3x1) from the pose estimation.
-      K: Camera intrinsic matrix.
+    STEP 3: exactly your original P = K [R | -R C]  +  cheirality test.
     """
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"Error: Could not load image: {img_path}")
+    # single K
+    K = np.asarray(next(iter(pose_data.values()))["camera_intrinsics"], np.float64)
+
+    all_pts = []
+    for key, info in pose_data.items():
+        A, B = info["imgA"], info["imgB"]
+        R1 = np.asarray(info["rotation_global_A"],      np.float64)
+        C1 = np.asarray(info["camera_center_global_A"], np.float64).reshape(3,1)
+        R2 = np.asarray(info["rotation_global_B"],      np.float64)
+        C2 = np.asarray(info["camera_center_global_B"], np.float64).reshape(3,1)
+
+        # build your exact P1,P2
+        P1 = K @ np.hstack((R1, -R1 @ C1))
+        P2 = K @ np.hstack((R2, -R2 @ C2))
+
+        ptsA = np.asarray(info["matched_points_imgA"], np.float64)
+        ptsB = np.asarray(info["matched_points_imgB"], np.float64)
+        mask = np.asarray(info["inlier_mask_pose"], np.int32).ravel().astype(bool)
+        ptsA_in, ptsB_in = ptsA[mask], ptsB[mask]
+        if len(ptsA_in) < 2:
+            if VERBOSE: print(f"[3] skip {key}: <2 inliers")
+            continue
+
+        X4 = cv2.triangulatePoints(P1, P2, ptsA_in.T, ptsB_in.T)
+        X3 = (X4[:3] / X4[3]).T
+
+        # cheirality in each camera
+        t1 = -R1 @ C1
+        t2 = -R2 @ C2
+        Z1 = ((R1 @ X3.T) + t1).T[:,2]
+        Z2 = ((R2 @ X3.T) + t2).T[:,2]
+        keep = (Z1 > 0) & (Z2 > 0)
+
+        pts3 = X3[keep]
+        info["triangulated_points_3d"]  = pts3.tolist()
+        info["num_triangulated_points"] = int(len(pts3))
+        all_pts.append(pts3)
+
+        if VERBOSE:
+            print(f"[3] {key}: kept {len(pts3)}/{len(X3)} pts")
+
+    out3 = os.path.join(
+        os.path.dirname(next(iter(pose_data.values()))["imgA"]),
+        "pose_and_triangulation_data.json"
+    )
+    with open(out3, "w") as f:
+        json.dump(pose_data, f, indent=2)
+    print(f"[3] Wrote triangulation data → {out3}")
+
+    # unified PLY (exactly as you had it)
+    if all_pts:
+        cloud = np.vstack(all_pts)
+        ply   = os.path.join(os.path.dirname(out3), "cloud.ply")
+        with open(ply, "w") as fp:
+            fp.write("ply\nformat ascii 1.0\n")
+            fp.write(f"element vertex {len(cloud)}\n")
+            fp.write("property float x\nproperty float y\nproperty float z\n")
+            fp.write("end_header\n")
+            for x,y,z in cloud:
+                fp.write(f"{x} {y} {z}\n")
+        print(f"[3] Wrote PLY → {ply}")
+    else:
+        print("[3] No points to write to PLY")
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+def main():
+    parent = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
+    folder = util.choose_image_set(parent)
+    if not folder:
+        print("No folder selected – exiting.")
         return
 
-    # Convert rotation matrix to rotation vector.
-    rvec, _ = cv2.Rodrigues(R)
-    # Project the 3D points into the image.
-    projected_points, _ = cv2.projectPoints(pts3d, rvec, t, K, None)
-    projected_points = projected_points.reshape(-1, 2)
+    tri_data  = estimate_relposes(folder)
+    pose_data = chain_global_poses(tri_data)
+    triangulate_and_write(pose_data)
 
-    # Create a copy for visualization.
-    vis_img = img.copy()
-
-    # Draw the original 2D keypoints (in green).
-    for pt in pts2d:
-        cv2.circle(vis_img, (int(pt[0]), int(pt[1])), 4, (0, 255, 0), -1)
-
-    # Draw the reprojected 3D points (in red).
-    for pt in projected_points:
-        cv2.circle(vis_img, (int(pt[0]), int(pt[1])), 4, (0, 0, 255), -1)
-
-    # Draw lines connecting corresponding points (in blue).
-    for pt2d, proj_pt in zip(pts2d, projected_points):
-        cv2.line(vis_img, (int(pt2d[0]), int(pt2d[1])), (int(proj_pt[0]), int(proj_pt[1])), (255, 0, 0), 1)
-
-    # Create a named window and resize it to be larger.
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1200, 800)
-    cv2.imshow(window_name, vis_img)
-    print("Press any key to close the visualization window...")
-    cv2.waitKey(0)
-    cv2.destroyWindow(window_name)
-
-def triangulate_and_merge(tri_data, chosen_folder):
-    """
-    For each image pair key in tri_data, constructs the projection matrices,
-    filters inlier correspondences using the inlier mask, triangulates points using OpenCV,
-    and then adds the triangulation results to the original data.
-    Finally, the merged data is saved in JSON format.
-    Also, for each pair, visualizes the correspondences on the first image.
-    """
-    for pair_key, pair_info in tri_data.items():
-        print(f"Processing pair: {pair_key}")
-
-        # Load camera intrinsics, recovered pose, and matched points.
-        K = np.array(pair_info["camera_intrinsics"], dtype=np.float64)
-        R2 = np.array(pair_info["rotation_recovered"], dtype=np.float64)
-        t2 = np.array(pair_info["translation_recovered"], dtype=np.float64).reshape(3, 1)
-
-        ptsA = np.array(pair_info["matched_points_imgA"], dtype=np.float64)
-        ptsB = np.array(pair_info["matched_points_imgB"], dtype=np.float64)
-
-        # Use the inlier mask from recoverPose (mask value 255 means inlier).
-        inlier_mask = np.array(pair_info["inlier_mask_pose_recovered"], dtype=np.int32)
-        ptsA_inliers = ptsA[inlier_mask == 255]
-        ptsB_inliers = ptsB[inlier_mask == 255]
-
-        # Construct projection matrices.
-        R1 = np.eye(3, dtype=np.float64)
-        t1 = np.zeros((3, 1), dtype=np.float64)
-        P1 = K @ np.hstack((R1, t1))
-        P2 = K @ np.hstack((R2, t2))
-
-        if ptsA_inliers.shape[0] < 2:
-            print(f"Warning: Not enough inliers to triangulate for pair {pair_key}. Skipping triangulation for this pair.")
-            pair_info["triangulated_points_3d"] = []
-            pair_info["num_triangulated_points"] = 0
-            continue
-
-        # Triangulate.
-        ptsA_for_triang = ptsA_inliers.T  # shape (2, N)
-        ptsB_for_triang = ptsB_inliers.T  # shape (2, N)
-        points_4d = cv2.triangulatePoints(P1, P2, ptsA_for_triang, ptsB_for_triang)
-
-        # Convert from homogeneous to 3D.
-        points_3d = points_4d[:3, :] / points_4d[3, :]
-        points_3d = points_3d.T  # shape (N, 3)
-        points_3d_list = points_3d.tolist()
-
-        # Append triangulation results to the original data.
-        pair_info["triangulated_points_3d"] = points_3d_list
-        pair_info["num_triangulated_points"] = len(points_3d_list)
-
-        # Visualization: extract the two image paths from the pair_key.
-        # Assuming pair_key is in the format "imgA_path::imgB_path"
-        if "::" in pair_key:
-            imgA_path, imgB_path = pair_key.split("::")
-        else:
-            print(f"Warning: pair_key {pair_key} is not in the expected format. Skipping visualization.")
-            continue
-
-        # Visualize correspondences on the first image.
-        # Using all 2D keypoints from image A.
-        visualize_correspondences(imgA_path, ptsA, np.array(points_3d_list, dtype=np.float32), 
-                                  R2, t2, K, window_name=f"Correspondences: {pair_key}")
-
-
-
-def main():
-    # Define the parent directory containing your images.
-    parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
-    chosen_folder = util.choose_image_set(parent_dir)
-    
-    # Path to the pose estimation data (output of your previous step).
-    pose_path = os.path.join(chosen_folder, "pose_estimation_data.json")
-    tri_data = util.load_json_data(pose_path)
-    
-    # Run triangulation and visualization.
-    triangulate_and_merge(tri_data, chosen_folder)
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
