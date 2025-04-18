@@ -1,231 +1,194 @@
-import os
-import json
-import numpy as np
-import cv2
+# ────────────────────── triangulate_and_ba.py ────────────────────────────
+"""
+1. Load pose_estimation_data.json (global poses + matches)
+2. For every image pair:
+      • build global projection matrices
+      • filter pose‑inliers, triangulate, cheirality‑filter
+      • subsample & run a *local* 2‑view bundle adjustment (BA)
+3. Append refined pose / points back into JSON
+4. Dump pose_and_triangulation_data.json and an aggregate PLY
+"""
+import os, json, cv2, numpy as np, util
 from scipy.optimize import least_squares
-import util
 
-ZERO_VEC3 = np.zeros(3, dtype=np.float64)
-SUBSET_SIZE = 2000  # maximum number of points to use in bundle adjustment
+SUBSET_SIZE = 2000        # max points per pair in BA
+MIN_INLIERS_BA = 6        # need at least this many after cheirality
+SKIP_RMS_THRESH = 0.5     # skip BA if pre-BA RMS < 0.5px
+ZERO3       = np.zeros(3, dtype=np.float64)
 
-def rodrigues_to_mat(rvec):
-    """Converts a Rodrigues rotation vector to a 3x3 rotation matrix."""
-    R, _ = cv2.Rodrigues(rvec)
-    return R
+# ──────────────────────────────────────────────────────────────────────────
+# Rodrigues helpers
+# ──────────────────────────────────────────────────────────────────────────
+def m2rvec(R):  return cv2.Rodrigues(R)[0].ravel()
+def rvec2m(r):  return cv2.Rodrigues(r)[0]
 
-def mat_to_rodrigues(R):
-    """Converts a 3x3 rotation matrix to a Rodrigues rotation vector."""
-    rvec, _ = cv2.Rodrigues(R)
-    return rvec
+# ──────────────────────────────────────────────────────────────────────────
+# project 3D→2D (no distortion)
+# ──────────────────────────────────────────────────────────────────────────
+def project(X, K, R, t):
+    Xc = R @ X.T + t[:,None]        # 3×N
+    uv = (K @ Xc)[:2] / Xc[2]       # 2×N
+    return uv.T                     # N×2
 
-def project_points_no_dist(pts_3d, K, R, t):
-    """
-    Vectorized version of projecting 3D points into 2D without distortion.
-    Args:
-      pts_3d: (N, 3) array of 3D points.
-      K:      (3, 3) camera intrinsics.
-      R:      (3, 3) rotation matrix.
-      t:      (3,)   translation vector.
-    Returns:
-      proj_2d: (N, 2) array of projected 2D points.
-    """
-    X_cam = R @ pts_3d.T + t.reshape(3, 1)   # shape => (3, N)
-    X_img = K @ X_cam  # shape => (3, N)
-    uv = X_img[:2] / X_img[2]  # shape => (2, N)
-    return uv.T
+# ──────────────────────────────────────────────────────────────────────────
+# build residual + sparsity for BA (camera1 fixed)
+# ──────────────────────────────────────────────────────────────────────────
+def make_ba_fun(K, pts1, pts2, n):
+    def residual(p):
+        r2, t2, X = p[:3], p[3:6], p[6:].reshape(n,3)
+        R2 = rvec2m(r2)
+        proj1 = project(X, K, np.eye(3), ZERO3)
+        proj2 = project(X, K, R2, t2)
+        return np.hstack([(proj1-pts1).ravel(),
+                          (proj2-pts2).ravel()])
+    # sparsity mask: 4n residuals × (6 + 3n) parameters
+    J = np.zeros((4*n, 6 + 3*n), dtype=int)
+    J[2*n:, :6] = 1
+    for i in range(n):
+        J[2*i:2*i+2,     6+3*i:6+3*i+3] = 1
+        J[2*n+2*i:2*n+2*i+2, 6+3*i:6+3*i+3] = 1
+    return residual, J
 
-def bundle_adjustment_residual(params, n_points, K, pts2d_cam1, pts2d_cam2):
-    """
-    Computes reprojection error residuals for:
-      - Camera1 (fixed: R=I, t=0)
-      - Camera2 (refined using Rodrigues + translation)
-      - 3D points (refined)
-    Parameter vector layout:
-      [rvec_cam2 (3), tvec_cam2 (3), X1 (3), X2 (3), ..., Xn (3)]
-    """
-    rvec2 = params[:3]
-    tvec2 = params[3:6]
-    pts_3d = params[6:].reshape(n_points, 3)
+# ──────────────────────────────────────────────────────────────────────────
+# process one pair: triangulate + BA
+# ──────────────────────────────────────────────────────────────────────────
+def process_pair(info, pose_dict):
+    K = np.asarray(info["camera_intrinsics"], np.float64)
+    R1, t1 = pose_dict[info["imgA"]]
+    R2, t2 = pose_dict[info["imgB"]]
 
-    R1 = np.eye(3, dtype=np.float64)
-    t1 = ZERO_VEC3
-    R2 = rodrigues_to_mat(rvec2)
+    ptsA = np.asarray(info["matched_points_imgA"], np.float64)
+    ptsB = np.asarray(info["matched_points_imgB"], np.float64)
+    mask = np.asarray(info["inlier_mask_pose"], np.int32)
 
-    proj_cam1 = project_points_no_dist(pts_3d, K, R1, t1)
-    proj_cam2 = project_points_no_dist(pts_3d, K, R2, tvec2)
+    # filter to pose inliers
+    ptsA, ptsB = ptsA[mask==1], ptsB[mask==1]
+    if len(ptsA) < MIN_INLIERS_BA:
+        print("  <6 inliers – skipping")
+        return None
 
-    residuals = np.empty(2 * n_points * 2, dtype=np.float64)
-    residuals[: n_points * 2] = (proj_cam1 - pts2d_cam1).ravel()
-    residuals[n_points * 2:] = (proj_cam2 - pts2d_cam2).ravel()
+    # triangulate in global frame
+    P1 = K @ np.hstack((R1, t1))
+    P2 = K @ np.hstack((R2, t2))
+    X4 = cv2.triangulatePoints(P1, P2, ptsA.T, ptsB.T)
+    X3 = (X4[:3]/X4[3]).T
 
-    return residuals
+    # cheirality filter
+    z1 = (R1[2] @ (X3.T - t1))
+    z2 = (R2[2] @ (X3.T - t2))
+    keep = (z1>0) & (z2>0)
+    X3, ptsA, ptsB = X3[keep], ptsA[keep], ptsB[keep]
+    n0 = len(X3)
+    if n0 < MIN_INLIERS_BA:
+        print("  <6 valid after cheirality – skipping")
+        return None
 
-def refine_pose_and_points_pair(pair_info):
-    """
-    Refines the second camera’s pose and the 3D points for a pair using two-view bundle adjustment.
-    Computes RMS reprojection error before and after refinement.
-    Optionally uses a random subset of the inlier points if there are too many.
-    """
-    # --- Gather Data ---
-    K = np.array(pair_info["camera_intrinsics"], dtype=np.float64)
-    R2_init = np.array(pair_info["rotation_recovered"], dtype=np.float64)
-    t2_init = np.array(pair_info["translation_recovered"], dtype=np.float64).reshape(3)
-    points_3d = np.array(pair_info["triangulated_points_3d"], dtype=np.float64)
+    # initial reprojection RMS (on all valid)
+    fun0, _ = make_ba_fun(K, ptsA, ptsB, n0)
+    p0 = np.hstack([m2rvec(R2), t2.ravel(), X3.ravel()])
+    rms0 = np.sqrt(np.mean(fun0(p0)**2))
+    print(f"  pre-BA RMS = {rms0:.3f}px  ({n0} points)")
 
-    ptsA = np.array(pair_info["matched_points_imgA"], dtype=np.float64)
-    ptsB = np.array(pair_info["matched_points_imgB"], dtype=np.float64)
-    inlier_mask = np.array(pair_info["inlier_mask_pose_recovered"], dtype=np.int32)
+    # skip BA if already low error
+    if rms0 < SKIP_RMS_THRESH:
+        return {
+            **info,
+            "triangulated_points_3d": X3.tolist(),
+            "num_triangulated_points": n0,
+            "rms_before": rms0,
+            "rms_after": rms0,
+            "ba_performed": False
+        }
 
-    # Filter to only inliers that were triangulated
-    valid_idx = (inlier_mask == 255)
-    ptsA_inliers = ptsA[valid_idx]
-    ptsB_inliers = ptsB[valid_idx]
+    # subsample to at most SUBSET_SIZE
+    if n0 > SUBSET_SIZE:
+        idx = np.random.choice(n0, SUBSET_SIZE, replace=False)
+        X3, ptsA, ptsB = X3[idx], ptsA[idx], ptsB[idx]
+    n = len(X3)
 
-    n_2d = len(ptsA_inliers)
-    n_3d = len(points_3d)
-    n = min(n_2d, n_3d)
+    # now build BA fun & sparsity with the **subsampled** n
+    fun, spars = make_ba_fun(K, ptsA, ptsB, n)
+    p0 = np.hstack([m2rvec(R2), t2.ravel(), X3.ravel()])  # length 6 + 3n
 
-    # Not enough points => skip
-    if n < 6:
-        print("Not enough points to run bundle adjustment for this pair.")
-        rvec2_init = mat_to_rodrigues(R2_init).flatten()
-        if len(points_3d) == 0:
-            return R2_init, t2_init, points_3d, 0.0, 0.0
+    # run sparse‑Jacobian BA (trf supports jac_sparsity)
+    res = least_squares(fun, p0,
+                        jac_sparsity=spars,
+                        method="trf",
+                        xtol=1e-8,
+                        ftol=1e-8,
+                        max_nfev=300)
 
-        R2_eval = rodrigues_to_mat(rvec2_init)
-        n_eval = min(len(ptsA_inliers), len(points_3d))
-        if n_eval == 0:
-            return R2_init, t2_init, points_3d, 0.0, 0.0
+    p_opt = res.x
+    R2_ref = rvec2m(p_opt[:3])
+    t2_ref = p_opt[3:6]
+    X3_ref = p_opt[6:].reshape(-1,3)
+    rms1 = np.sqrt(np.mean(fun(p_opt)**2))
 
-        X_eval = points_3d[:n_eval]
-        A_eval = ptsA_inliers[:n_eval]
-        B_eval = ptsB_inliers[:n_eval]
+    return {
+        **info,
+        "rotation_refined_global":       R2_ref.tolist(),
+        "translation_refined_global":    t2_ref.tolist(),
+        "triangulated_points_3d":        X3_ref.tolist(),
+        "num_triangulated_points":       len(X3_ref),
+        "rms_before":                    rms0,
+        "rms_after":                     rms1,
+        "ba_performed":                  True
+    }
 
-        R1 = np.eye(3, dtype=np.float64)
-        t1 = ZERO_VEC3
-        proj1 = project_points_no_dist(X_eval, K, R1, t1)
-        proj2 = project_points_no_dist(X_eval, K, R2_eval, t2_init)
-
-        residuals = np.concatenate([proj1.ravel() - A_eval.ravel(), 
-                                    proj2.ravel() - B_eval.ravel()])
-        error = np.sqrt(np.mean(residuals**2))
-        return R2_init, t2_init, points_3d, error, error
-
-    # Use only the first n valid inliers & points
-    ptsA_inliers = ptsA_inliers[:n]
-    ptsB_inliers = ptsB_inliers[:n]
-    points_3d = points_3d[:n]
-
-    # Optionally select a random subset if too many points are available
-    if n > SUBSET_SIZE:
-        indices = np.random.choice(n, SUBSET_SIZE, replace=False)
-        ptsA_inliers = ptsA_inliers[indices]
-        ptsB_inliers = ptsB_inliers[indices]
-        points_3d = points_3d[indices]
-        n = SUBSET_SIZE
-
-    # --- Compute Reprojection Error Before Optimization ---
-    rvec2_init = mat_to_rodrigues(R2_init).flatten()
-    R2_eval = rodrigues_to_mat(rvec2_init)
-    R1 = np.eye(3, dtype=np.float64)
-    t1 = ZERO_VEC3
-
-    proj_cam1_before = project_points_no_dist(points_3d, K, R1, t1)
-    proj_cam2_before = project_points_no_dist(points_3d, K, R2_eval, t2_init)
-    residuals_before = np.concatenate([(proj_cam1_before - ptsA_inliers).ravel(),
-                                       (proj_cam2_before - ptsB_inliers).ravel()])
-    error_before = np.sqrt(np.mean(residuals_before**2))
-
-    # --- Bundle Adjustment ---
-    x0 = np.hstack((rvec2_init, t2_init, points_3d.ravel()))
-    fun = lambda p: bundle_adjustment_residual(p, n, K, ptsA_inliers, ptsB_inliers)
-    result = least_squares(fun, x0, method='lm',
-                           xtol=1e-12, ftol=1e-12, gtol=1e-12,
-                           max_nfev=1000)
-    refined = result.x
-    rvec2_refined = refined[:3]
-    tvec2_refined = refined[3:6]
-    points_3d_refined = refined[6:].reshape((n, 3))
-    R2_refined = rodrigues_to_mat(rvec2_refined)
-
-    # --- Compute Reprojection Error After Optimization ---
-    proj_cam1_after = project_points_no_dist(points_3d_refined, K, R1, t1)
-    proj_cam2_after = project_points_no_dist(points_3d_refined, K, R2_refined, tvec2_refined)
-    residuals_after = np.concatenate([(proj_cam1_after - ptsA_inliers).ravel(),
-                                      (proj_cam2_after - ptsB_inliers).ravel()])
-    error_after = np.sqrt(np.mean(residuals_after**2))
-
-    return R2_refined, tvec2_refined, points_3d_refined, error_before, error_after
-
-def write_ply(filename, points):
-    """
-    Write a simple ASCII PLY file for a point cloud.
-    Points should be an (N,3) array or list of [x, y, z].
-    """
-    with open(filename, 'w') as f:
-        f.write("ply\n")
-        f.write("format ascii 1.0\n")
-        f.write(f"element vertex {len(points)}\n")
-        f.write("property float x\n")
-        f.write("property float y\n")
-        f.write("property float z\n")
-        f.write("end_header\n")
-        for p in points:
-            f.write(f"{p[0]} {p[1]} {p[2]}\n")
-
+# ──────────────────────────────────────────────────────────────────────────
+# Main driver
+# ──────────────────────────────────────────────────────────────────────────
 def main():
-    parent_dir = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
-    chosen_folder = util.choose_image_set(parent_dir)
-    pose_path = os.path.join(chosen_folder, "pose_and_triangulation_data.json")
+    parent = r'C:\Projects\Semester6\CS4501\stereo_reconstruction\data\images'
+    folder = util.choose_image_set(parent)
+    if not folder:
+        return
 
-    tri_data = util.load_json_data(pose_path)
-    errors_before_list = []
-    errors_after_list = []
-    all_refined_points = []
+    with open(os.path.join(folder, "pose_estimation_data.json")) as f:
+        pairs = json.load(f)
 
-    for pair_key, pair_info in tri_data.items():
-        print(f"Running bundle adjustment for pair: {pair_key}")
+    # build global pose dictionary
+    pose_dict = {pairs[next(iter(pairs))]["imgA"]: (np.eye(3), np.zeros((3,1)))}
+    for v in pairs.values():
+        pose_dict.setdefault(
+            v["imgB"],
+            (np.asarray(v["rotation_recovered_global"], np.float64),
+             np.asarray(v["translation_recovered_global"], np.float64).reshape(3,1))
+        )
 
-        if "triangulated_points_3d" not in pair_info or len(pair_info["triangulated_points_3d"]) < 1:
-            print(f"No triangulated points found for pair {pair_key}, skipping.")
-            continue
+    # process each pair in parallel
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    args = [(info, pose_dict) for info in pairs.values()]
+    updated = {}
+    with ProcessPoolExecutor(max_workers=4) as exe:
+        futures = [exe.submit(process_pair, info, pose_dict) for info in pairs.values()]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                key = f"{result['imgA']}::{result['imgB']}"
+                updated[key] = result
+                print(f"[OK] {key}: {result['num_triangulated_points']} pts, RMS {result['rms_after']:.3f}, BA={result['ba_performed']}")
 
-        R2_refined, t2_refined, points_3d_refined, error_before, error_after = refine_pose_and_points_pair(pair_info)
+    # merge back and save
+    for k,v in updated.items():
+        pairs[k] = v
 
-        # Store results
-        pair_info["rotation_refined"] = R2_refined.tolist()
-        pair_info["translation_refined"] = t2_refined.tolist()
-        pair_info["triangulated_points_3d_refined"] = points_3d_refined.tolist()
-        pair_info["num_points_refined"] = len(points_3d_refined)
-        pair_info["reprojection_error_before"] = error_before
-        pair_info["reprojection_error_after"] = error_after
+    out = os.path.join(folder, "pose_and_triangulation_data.json")
+    with open(out, "w") as f:
+        json.dump(pairs, f, indent=2)
+    print(f"\n[✓] Wrote refined data → {out}")
 
-        errors_before_list.append(error_before)
-        errors_after_list.append(error_after)
-        all_refined_points.extend(points_3d_refined.tolist())
-
-        print(f"Pair {pair_key}: Reprojection error before = {error_before:.4f}, after = {error_after:.4f}")
-
-    # Write out updated JSON
-    output_path = os.path.join(chosen_folder, "bundle_adjusted_data.json")
-    with open(output_path, 'w') as f:
-        json.dump(tri_data, f, indent=2)
-    print(f"Bundle adjustment complete. Refined data saved to {output_path}")
-
-    # Print global mean errors
-    if errors_before_list and errors_after_list:
-        global_error_before = np.mean(errors_before_list)
-        global_error_after = np.mean(errors_after_list)
-        print(f"Global average reprojection error before: {global_error_before:.4f}")
-        print(f"Global average reprojection error after:  {global_error_after:.4f}")
-
-    # Write combined PLY
-    if all_refined_points:
-        ply_filename = os.path.join(chosen_folder, "refined_point_cloud.ply")
-        write_ply(ply_filename, all_refined_points)
-        print(f"Refined point cloud saved to {ply_filename}")
-    else:
-        print("No refined points available to write a point cloud file.")
+    # write aggregate PLY
+    all_pts = [pt for info in pairs.values() if "triangulated_points_3d" in info
+               for pt in info["triangulated_points_3d"]]
+    if all_pts:
+        ply = os.path.join(folder, "refined_cloud.ply")
+        with open(ply, "w") as f:
+            f.write("ply\nformat ascii 1.0\nelement vertex "+str(len(all_pts))+"\n")
+            f.write("property float x\nproperty float y\nproperty float z\nend_header\n")
+            for x,y,z in all_pts:
+                f.write(f"{x} {y} {z}\n")
+        print(f"[✓] Saved cloud → {ply}")
 
 if __name__ == "__main__":
     main()
