@@ -2,11 +2,24 @@
 
 Sparse 3D reconstruction from an image pair using a classical Structure-from-Motion (SfM) pipeline in Python/OpenCV. Estimates relative pose from SIFT matches, chains poses into a shared frame, and triangulates a sparse 3D point cloud.
 
-## Pipeline Visualization
 
+## Inlier Visualization
+
+<p float="left">
+  <img src="images/chapelinlier.png" width="45%" alt="i1" />
+  <img src="images/chapelinlier2.png"      width="45%" alt="i2" />
+</p>
+
+
+## Pipeline Visualization
 <p float="left">
   <img src="images/chapel1.png" width="45%" alt="PC1" />
   <img src="images/chapel2.png"      width="45%" alt="PC2" />
+</p>
+
+## Camera Pose Estimation
+<p float="center">
+  <img src="images/poses.png" width="80%" alt="PC1" />
 </p>
 
 
